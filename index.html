@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bytecode: an interactive monograph on the CPython interpreter</title>
+  <meta name="description" content="A long-form interactive treatment of the CPython interpreter: source compilation to bytecode, the value stack, frames and the call stack, reference counting, cyclic garbage collection, the specialising adaptive interpreter, and free-threaded CPython. With a literature review.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <div class="progress" aria-hidden="true"><span id="progress-bar"></span></div>
+
+  <header class="site-head">
+    <div class="wrap">
+      <a class="brand" href="index.html">Bytecode</a>
+      <span class="tagline">An interactive monograph on the CPython interpreter</span>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1" class="essay">
+    <div class="wrap">
+      <h1>Bytecode</h1>
+      <p class="lede">
+        The compact instructions a Python program is compiled to, the machine
+        that executes them, the strategies that keep it efficient, and the
+        memory model that keeps it correct.
+      </p>
+
+      <p class="docmeta">
+        An interactive monograph in ten sections, with six live figures.
+        <b>Reading time</b> roughly fifty minutes. The figures are operable by
+        mouse, touch and keyboard, and the document conforms to WCAG&nbsp;2.2&nbsp;AA.
+        Built as a single static page in vanilla HTML, CSS and JavaScript, with
+        no framework and no build step.
+      </p>
+
+      <section class="abstract" aria-label="Abstract">
+        <h2>Abstract</h2>
+        <p>
+          The Python language is a specification; CPython is the canonical
+          implementation that turns that specification into actual computation
+          on real hardware. CPython does the work in three movements. It
+          parses the source into an abstract syntax tree and compiles that
+          tree into a sequence of bytecodes, the compact instructions of a
+          stack machine. It executes those bytecodes by an evaluation loop
+          that pushes and pops values on a per-frame stack, calls into C
+          implementations of each opcode, and unwinds frames on return. And
+          it manages memory by reference counting, supplemented by a cyclic
+          garbage collector that reclaims unreachable cycles the refcount
+          alone cannot. The architecture has been remarkably stable since
+          the early 1990s, while the engines built around it have changed
+          considerably: the specialising adaptive interpreter introduced in
+          CPython 3.11 made the bytecode loop dramatically faster at no
+          source-language cost, and the free-threaded build introduced as
+          an option in CPython 3.13 has begun to remove the global
+          interpreter lock that long limited the parallelism of pure-Python
+          code.
+        </p>
+        <p>
+          This document develops the interpreter from the foundation. It
+          treats the source-to-bytecode compilation, the value stack, the
+          call stack, reference counting, cyclic garbage collection, the
+          specialising adaptive interpreter and the threading model. Every
+          figure runs the genuine mechanism on synthetic input: the
+          disassembly figure walks the program counter through a real
+          opcode sequence; the value-stack figure applies each opcode to a
+          real stack; the reference-counting figure increments and
+          decrements integer refcounts on a real object graph; the cyclic
+          garbage-collection figure executes a working mark-and-sweep; and
+          the specialising-interpreter figure increments execution counters
+          and rewrites the opcode at the documented threshold.
+        </p>
+      </section>
+
+      <nav class="toc" aria-label="Table of contents">
+        <h2>Contents</h2>
+        <ol>
+          <li><a href="#s1">Reading the language one instruction at a time</a></li>
+          <li><a href="#s2">The source, the compiler and the bytecode</a></li>
+          <li><a href="#s3">A history of CPython internals: a literature review</a></li>
+          <li><a href="#s4">The value stack</a></li>
+          <li><a href="#s5">Reference counting</a></li>
+          <li><a href="#s6">Cyclic garbage collection</a></li>
+          <li><a href="#s7">The specialising adaptive interpreter</a></li>
+          <li><a href="#s8">Frames and the call stack</a></li>
+          <li><a href="#s9">Free-threaded CPython and the GIL</a></li>
+          <li><a href="#s10">Conclusion</a></li>
+        </ol>
+      </nav>
+
+      <section id="s1">
+        <h2><span class="secnum">1</span>Reading the language one instruction at a time</h2>
+        <p>
+          A line of Python code such as <code>c = a + b</code> looks atomic to
+          the reader and is anything but to the machine. By the time it
+          executes, the source has been parsed into a tree, the tree has been
+          compiled into a sequence of bytecodes, and those bytecodes have been
+          run by an interpreter that loads each operand onto a stack, performs
+          the addition, and stores the result back into a local. Each of those
+          steps is a separate piece of machinery, and CPython exposes most of
+          them. The <code>dis</code> module disassembles a function into the
+          bytecodes it compiles to; the <code>sys.settrace</code> hook
+          observes the interpreter as it runs; <code>sys.getrefcount</code>
+          reads the reference count of any object; <code>gc</code> controls
+          the cyclic garbage collector. The interpreter is, by the standards
+          of language runtimes, unusually inspectable.
+        </p>
+        <p>
+          The reason to know the interpreter at this level is not, in most
+          working software, performance. Pure Python code is at most a few
+          times faster on CPython 3.13 than on CPython 3.10, and a hot
+          numerical loop in Python remains an order of magnitude slower than
+          the equivalent in C. The reasons are diagnostic and structural.
+          Tracebacks become legible when one knows what a stack frame is.
+          Memory leaks become reproducible when one understands which kinds
+          of cycle the cyclic collector can and cannot reclaim. The
+          performance regressions between Python versions become explainable
+          when one understands which opcodes specialise and which do not.
+          And the surprising behaviour of certain idioms, such as the
+          difference between mutating a default argument and replacing it,
+          turns out to follow from concrete mechanical facts about the
+          interpreter rather than from any subtlety of the language
+          specification.
+        </p>
+        <p>
+          This document treats the interpreter as a working machine to be
+          observed. The figures execute synthetic programs and expose, at
+          each step, the program counter, the value stack, the call stack,
+          the reference counts, the reachability graph and the
+          specialisation counters. Each figure corresponds to one of the
+          parts of CPython's runtime, and the prose that surrounds them
+          gives the names by which to find the same parts in the source
+          tree of the interpreter at <code>github.com/python/cpython</code>.
+        </p>
+      </section>
+
+      <section id="s2">
+        <h2><span class="secnum">2</span>The source, the compiler and the bytecode</h2>
+        <p>
+          When CPython is given a Python source file it does not interpret
+          the text. The text is first lexed into tokens by the C tokenizer in
+          <code>Parser/tokenizer.c</code>, then parsed by the PEG parser
+          described in PEP 617 into an abstract syntax tree, and then
+          lowered by the compiler in <code>Python/compile.c</code> into a
+          code object. The code object is the runtime artefact: it contains
+          the bytecode as a sequence of bytes, the constants the function
+          uses, the names of its local variables, and the metadata that
+          maps each bytecode back to a source line for tracebacks.
+        </p>
+        <p>
+          The bytecode itself is a sequence of opcodes, each consisting of a
+          single-byte instruction and a single-byte argument. In CPython 3.6
+          the format was widened from variable-length to a uniform two-byte
+          instruction, an arrangement called wordcode that simplifies the
+          dispatcher and reduces the number of memory loads per instruction.
+          The instruction set is small: in the order of a hundred and fifty
+          opcodes, of which the dozen most common, the loads, stores, the
+          binary operators, the comparison, and the function call, dominate
+          almost every program.
+        </p>
+
+        <div id="fig-listing"></div>
+
+        <p>
+          The figure above shows a tiny Python function alongside its
+          disassembly. The program counter advances by the arrow keys when
+          the figure is focused, and the active source line and active
+          bytecode are marked with a leading chevron, an
+          <code>aria-current</code> attribute and a highlighted background,
+          so that the connection between the two views is visible at every
+          step. The opcodes shown, <code>LOAD_FAST</code>,
+          <code>BINARY_ADD</code>, <code>STORE_FAST</code>,
+          <code>LOAD_CONST</code>, <code>BINARY_MUL</code> and
+          <code>RETURN_VALUE</code>, are the real CPython opcode names; the
+          arguments are the names of the function's locals or the indices
+          of its constants. Running the same example in Python with
+          <code>dis.dis(total)</code> produces the same listing.
+        </p>
+        <p>
+          Some opcodes carry a richer payload than their byte width suggests.
+          The opcode <code>EXTENDED_ARG</code> prefixes the next instruction
+          with the high bits of its argument, allowing arguments larger than
+          two hundred and fifty-five. The <code>CALL</code> opcode carries
+          a small argument and reads its full call signature, including
+          keyword arguments, from a small inline cache attached to the
+          bytecode. The CPython compiler also performs limited optimisations
+          before emitting code: constant folding, dead-code elimination, and
+          peephole substitutions that combine common opcode pairs. The
+          compiler is intentionally simple, leaving heavier optimisation to
+          the runtime, which the seventh section describes.
+        </p>
+        <p>
+          The code object itself is, in CPython 3.11 and later, a richer
+          structure than it used to be. Alongside the bytecode it carries
+          inline caches that the specialising interpreter writes into at
+          runtime, a positions table that maps each bytecode to the
+          column range of the source it came from (so that error messages
+          can point at the failing sub-expression rather than the whole
+          line), the exception table that the eval loop consults to find
+          handlers when an exception propagates, and a localsplus table
+          that consolidates the function's parameters, local variables,
+          cell variables and free variables in a single addressable
+          array. Each of these tables is the result of a separate piece
+          of engineering work that addressed a definite limitation of
+          the previous code-object layout, and together they make the
+          code object the central artefact through which the eval loop
+          interacts with the rest of the runtime.
+        </p>
+      </section>
+
+      <section id="s3">
+        <h2><span class="secnum">3</span>A history of CPython internals: a literature review</h2>
+        <p>
+          CPython has had three principal eras of internal work, and the
+          present interpreter is the layered result of all three. The
+          account that follows is causal: in each case the question is which
+          limitation of the previous era the next set of changes was made to
+          address.
+        </p>
+        <p>
+          The first era covers the original implementation. Guido van Rossum
+          described Python in a 1995 technical report and a small early
+          paper, and the implementation he wrote was a textbook tree-walking
+          interpreter that lowered the abstract syntax tree to a stack-based
+          bytecode and ran the bytecode in a simple eval loop. The
+          architectural decisions of that era persist into the current
+          interpreter: the stack machine, the reference-counting memory
+          manager, the per-thread Python state and the global interpreter
+          lock that simplifies it, the convention that the C API exposes the
+          internals to extension modules. These choices were taken because
+          they made the runtime small, portable and easy to embed, and they
+          had the corollary that the runtime did not aspire to compete on
+          raw speed with the just-in-time compilers that were already
+          beginning to appear in academic Lisp and Smalltalk
+          implementations. Aycock's 2003 survey
+          <a class="cite" href="#ref-1">[1]</a> places the state of
+          just-in-time compilation at that point: it had become well
+          established in the academic community but had not yet entered any
+          mainstream dynamic-language production runtime.
+        </p>
+        <p>
+          The second era is the line of work that took place outside the
+          CPython codebase and demonstrated that Python could be much
+          faster. PyPy, started in the early 2000s and described by Bolz
+          and colleagues in 2009 <a class="cite" href="#ref-2">[2]</a>,
+          built an alternative Python implementation in a restricted
+          subset of Python called RPython, and applied to that subset a
+          meta-tracing just-in-time compiler that generated efficient
+          machine code for hot loops. PyPy was, and remains, much faster
+          than CPython on pure-Python workloads, by factors of five to
+          twenty on common benchmarks, but it did not displace CPython in
+          deployment because of the gravitational mass of the existing C
+          extension ecosystem: NumPy, lxml, cryptography and thousands of
+          smaller packages all depend on the CPython C API, and PyPy's
+          alternative API, cpyext, although valiant, never closed the
+          compatibility gap. Pyston, started at Dropbox in 2014
+          <a class="cite" href="#ref-3">[3]</a>, attempted a different
+          tactic, building a JIT on top of the LLVM toolchain that ran in
+          place of CPython's eval loop while preserving the C API; it was
+          partially successful at speeding up production workloads and was
+          eventually retired. The Truffle project at Oracle Labs
+          <a class="cite" href="#ref-4">[4]</a> went a third route, with a
+          partial-evaluation framework on top of which GraalPython runs;
+          again the technique works and again the C API compatibility
+          question kept it from CPython displacement.
+        </p>
+        <p>
+          The fact behind the second era's history is that every Python
+          implementation faster than CPython either gave up some of the
+          C API compatibility or lived as an alternative interpreter that
+          users could not assume their dependencies supported. The lesson
+          that the third era of work has taken is that the same speed gains
+          must be obtained inside CPython itself, with the C API preserved.
+          The line was begun, intellectually, by Mark Shannon's PhD work on
+          type inference and deoptimisation
+          <a class="cite" href="#ref-5">[5]</a>, which laid out how a
+          dynamic-language interpreter could specialise its operations to
+          observed types without losing the ability to fall back when the
+          types changed. It became practical with PEP 659
+          <a class="cite" href="#ref-6">[6]</a>, the specialising adaptive
+          interpreter, which Shannon led into CPython 3.11. The companion
+          piece, PEP 657 <a class="cite" href="#ref-7">[7]</a>, added
+          fine-grained error locations so that the new interpreter could
+          point users to the exact failing sub-expression rather than only
+          the failing line. The Faster CPython project, sponsored by
+          Microsoft, has continued to deliver substantial speed-ups in
+          each release since.
+        </p>
+        <p>
+          The third era's other major thread is the slow removal of the
+          global interpreter lock. PEP 703 by Sam Gross
+          <a class="cite" href="#ref-8">[8]</a>, accepted in 2023 and
+          shipped as an option in CPython 3.13, makes the GIL removable at
+          build time, with the reference-counting memory manager rewritten
+          to use atomic operations and the cyclic garbage collector
+          adjusted to coordinate with a multi-threaded mutator. The trade-off
+          is that the free-threaded build is currently slower on
+          single-threaded workloads than the build with the GIL retained,
+          because the atomic refcount operations cost more than the
+          unguarded increments of the original. The expectation is that the
+          gap will narrow as the implementation matures, and that
+          free-threaded CPython will become the default once it does. The
+          Instagram fork called Cinder, the Pyjion JIT, and the academic
+          Skybison interpreter at Meta have all contributed engineering
+          ideas to this thread.
+        </p>
+        <p>
+          Two threads run through this history. The first is the steady
+          professionalisation of CPython's performance work: from a
+          tree-walking interpreter written quickly in C, through a long
+          period in which raw performance was treated as someone else's
+          problem, into a sustained engineering effort to make CPython
+          itself fast without compromising compatibility. The second is
+          the gradual replacement of architectural commitments that were
+          taken for granted: the inflexibility of the bytecode dispatcher
+          is being replaced by specialisation; the global interpreter lock
+          is being made optional; the memory manager is being audited
+          against the assumption of multi-threaded mutation. The CPython
+          of 2030 will look, internally, substantially different from the
+          CPython of 2010, and it will run almost the same Python
+          programmes from the same surface language.
+        </p>
+        <a class="totop" href="#main">Return to contents</a>
+      </section>
+
+      <section id="s4">
+        <h2><span class="secnum">4</span>The value stack</h2>
+        <p>
+          CPython is a stack machine. Each frame, the runtime object
+          corresponding to one invocation of a function, owns a small
+          value stack on which the interpreter places the operands and
+          results of bytecodes. Loading a local pushes its current value;
+          storing a local pops the top of the stack into the named
+          binding; a binary operator pops two values, computes a result
+          and pushes the result back. The opcodes are short and the
+          dispatcher is simple, and the stack-machine choice was made for
+          exactly that simplicity.
+        </p>
+        <p>
+          A stack-based bytecode is one of two common designs; the other
+          is a register-based bytecode in which each opcode names its
+          operands and result by small integers. Lua and the V8
+          JavaScript engine's Ignition interpreter both use register
+          machines. The trade-off is well understood: register code is
+          usually shorter, by an opcode count, because operations that a
+          stack machine would express by loading and storing twice can be
+          expressed by a single three-register operation; but stack code
+          is more uniform, simpler to generate, and easier to optimise
+          peephole-style. Python's choice has not changed across its
+          history, although the specialising interpreter of the seventh
+          section has begun to add register-like behaviour for the most
+          common opcode sequences.
+        </p>
+
+        <div id="fig-stack"></div>
+
+        <p>
+          The figure above runs the bytecode of the previous section
+          against a real value stack, presented as a DOM table for screen
+          readers and zoom users. Stepping through the bytecode pushes
+          and pops values, and the cell at depth zero is the top of the
+          stack at any moment. The <code>STORE_FAST</code> instruction
+          pops without pushing; <code>LOAD_CONST</code> pushes a literal
+          constant; <code>BINARY_ADD</code> and <code>BINARY_MUL</code>
+          pop two values and push one; the final <code>RETURN_VALUE</code>
+          takes the top of the stack as the function's return.
+        </p>
+        <p>
+          Two practical notes attach to the value stack. The maximum
+          stack depth for a function is computed by the compiler and
+          stored as the <code>co_stacksize</code> attribute of the code
+          object; the interpreter pre-allocates that many slots for the
+          frame at call time, so stack overflow inside a single function
+          is impossible by construction. Deep recursion is limited by a
+          separate mechanism, the call-stack depth that the ninth section
+          covers. The other note is that the stack is not visible from
+          Python except via the <code>sys.settrace</code> hook, which
+          observes execution at the granularity of frames and source
+          lines; the stack contents at intermediate points within a line
+          can be reached only with C-level debugging or with the
+          <code>dis</code> module's analysis of what the bytecode does.
+        </p>
+        <p>
+          The eval loop itself sits in <code>Python/ceval.c</code> and is
+          one of the most-edited files in CPython's history. It consists
+          of a giant switch on the opcode of the current instruction,
+          with a case for each opcode that pops its inputs from the
+          stack, calls the C implementation of that operation, pushes
+          the result and advances the program counter. On a compiler
+          that supports computed gotos the switch is implemented with a
+          dispatch table indexed by opcode, which removes a branch
+          misprediction at the top of every iteration and was one of
+          the largest single performance improvements in the loop's
+          history. The loop also services exceptions: when a C-level
+          operation signals failure, the loop walks the exception table
+          attached to the code object to find the handler, unwinds the
+          stack to the handler's expected depth, and resumes
+          dispatching from the handler's bytecode offset.
+        </p>
+      </section>
+
+      <section id="s5">
+        <h2><span class="secnum">5</span>Reference counting</h2>
+        <p>
+          CPython manages memory primarily by reference counting. Every
+          Python object carries an integer field, the reference count,
+          which tracks how many references currently point at it. When a
+          name is bound to an object the count is incremented; when a
+          binding goes out of scope or is rebound to a different object
+          the count is decremented. When the count reaches zero the
+          object is immediately reclaimed: its finalisers run and its
+          memory is returned to the allocator. The immediacy is a
+          deliberate property of the design, and is why CPython's memory
+          footprint is often smaller than that of garbage-collected
+          languages: objects do not wait for a collector cycle before
+          their resources are released.
+        </p>
+        <p>
+          The figure below executes a short script of name bindings on a
+          small object graph and shows each object's reference count
+          updating as bindings are added and removed. The script creates
+          a list, binds three names to it, deletes one of those bindings,
+          creates a second list, rebinds one of the surviving names to
+          the second list, and deletes the remaining two names of the
+          first list; the figure follows the counts through to the point
+          where the first list's count reaches zero and the object is
+          reclaimed.
+        </p>
+
+        <div id="fig-refcount"></div>
+
+        <p>
+          Reference counting has two well-known limitations. The first is
+          its cost: every binding and every rebinding incurs an atomic
+          increment or decrement, which dominates the cost of trivial
+          operations on small objects and contributes the largest share
+          of the overhead of free-threaded CPython, where the increments
+          and decrements must be properly atomic with respect to other
+          threads. The second is that it cannot reclaim reference
+          cycles: two objects that reference one another keep each
+          other's counts above zero indefinitely, even when no other
+          part of the program can reach them. The sixth section
+          addresses this with the cyclic garbage collector.
+        </p>
+        <p>
+          The C API exposes the reference count through the
+          <code>Py_INCREF</code>, <code>Py_DECREF</code> and
+          <code>Py_XDECREF</code> macros, and a substantial part of the
+          discipline of writing a CPython extension is the discipline of
+          balancing those macros so that no reference is leaked or
+          double-freed. The cython, pybind11 and nanobind tools each
+          remove that burden in their own way, and the move toward
+          higher-level binding generators has been driven, in part, by
+          the difficulty of getting reference-count management right by
+          hand in non-trivial extensions.
+        </p>
+        <p>
+          The integer in the reference count is <code>Py_ssize_t</code>,
+          a signed integer wide enough to address every byte of memory
+          the platform supports, so the count cannot overflow on any
+          plausible workload. The header that contains the count also
+          contains the type pointer of the object, which is the single
+          piece of metadata every CPython object carries and which the
+          eval loop dispatches against. The total per-object overhead
+          is therefore two pointers' worth of memory, twenty-four bytes
+          per object on a sixty-four-bit system once the count is
+          included, which is the per-object floor that any Python
+          program pays. Variable-sized objects, including tuples, lists
+          and strings, carry their length in a second header field, the
+          <code>ob_size</code>, used by the allocator to determine how
+          much memory the object occupies. The C structure that
+          combines these fields, <code>PyObject</code>, is the
+          most-included header in the CPython codebase and the one
+          whose layout decisions have the most pervasive effects on
+          the rest of the runtime.
+        </p>
+      </section>
+
+      <section id="s6">
+        <h2><span class="secnum">6</span>Cyclic garbage collection</h2>
+        <p>
+          A reference-counting system cannot reclaim a cycle: two objects
+          that reference one another keep each other alive even after
+          every external reference has been removed. CPython solves this
+          with a generational cyclic garbage collector that runs
+          periodically and reclaims the cycles that the reference count
+          alone cannot. The collector is in <code>Modules/gcmodule.c</code>
+          and is exposed to Python through the <code>gc</code> module.
+        </p>
+        <p>
+          The collector observes that, for an object to be unreachable, no
+          chain of references from any root must reach it. The roots in
+          CPython are the per-thread frame stacks, the per-interpreter
+          modules and built-in references, and a handful of other live
+          containers. A standard mark-and-sweep over the heap would
+          identify the unreachable set: starting from the roots, every
+          object reachable by following references is marked; on a
+          second pass everything unmarked is reclaimed. CPython does
+          something subtler in practice. To avoid the cost of marking
+          every object on every collection it uses generations: objects
+          are placed in a young generation when they are created, and
+          objects that survive a generation's collection are promoted to
+          an older generation, where they are scanned less often. The
+          generational hypothesis, that most objects die young, is
+          empirically true in Python programs, and the saving is
+          substantial.
+        </p>
+
+        <div id="fig-gc"></div>
+
+        <p>
+          The figure above runs a simplified mark-and-sweep on a small
+          object graph. The graph contains a reachable object accessible
+          from the root, a cycle of two mutually referencing objects
+          unreachable from any root, and a third object that the root
+          reaches by a different path. Pressing <em>Run GC</em> performs
+          the mark phase, traversing references from the root and
+          marking every reached object, then the sweep phase, which
+          reclaims everything unmarked. The cyclic pair vanishes; the
+          reachable objects survive. The active object selected by the
+          radiogroup shows its current reachability status in the
+          stats below the figure.
+        </p>
+        <p>
+          Two design notes complete the picture. The collector treats
+          only objects that the interpreter believes might participate
+          in cycles; many built-in types, such as integers, strings and
+          tuples of immutable elements, cannot form cycles and are
+          excluded from the collector's traversal. The collector also
+          handles the awkward case of objects with finalisers
+          (<code>__del__</code> methods) in a cycle: a cycle of such
+          objects requires the collector to choose an order in which to
+          finalise them, and historically this was a source of bugs and
+          surprising behaviour. PEP 442, implemented in CPython 3.4,
+          revised the protocol so that any object can safely be
+          finalised inside a cycle, removing the long-standing
+          documentation footnote that warned users against the practice.
+        </p>
+        <p>
+          The collector's interaction with the C extension ecosystem
+          deserves a brief note. An extension that holds references to
+          Python objects from C structures must, if those structures
+          can participate in cycles, expose a traverse function so the
+          collector can walk through them. The convention is the
+          <code>tp_traverse</code> slot on the type object, which the
+          collector calls during the mark phase, passing each contained
+          reference to a visitor function. An extension that participates
+          in cycles but does not implement <code>tp_traverse</code>
+          leaks those cycles; an extension that implements it correctly
+          allows the collector to reclaim them. The same machinery
+          underlies the <code>gc.get_referents</code> function exposed to
+          Python, which returns the references an object holds and is
+          one of the more useful primitives for tracking down memory
+          leaks in long-running services.
+        </p>
+      </section>
+
+      <section id="s7">
+        <h2><span class="secnum">7</span>The specialising adaptive interpreter</h2>
+        <p>
+          For most of its history CPython's evaluation loop dispatched a
+          generic implementation for each opcode. The
+          <code>BINARY_ADD</code> opcode would, on each execution, call
+          into the C function that knows how to add two arbitrary Python
+          objects, which then dispatched on their types to the integer,
+          string, list or user-defined-class addition. The cost of that
+          per-execution dispatch dominated the cost of the actual work
+          for most opcodes, and the speed of a Python loop was
+          determined less by the addition than by the bookkeeping around
+          it.
+        </p>
+        <p>
+          The specialising adaptive interpreter, introduced in PEP 659
+          <a class="cite" href="#ref-6">[6]</a> and shipped in CPython
+          3.11, addressed this. Each opcode begins life as its generic
+          form. A small counter inline with the bytecode tracks how
+          often the opcode has executed. After a threshold the
+          interpreter looks at the actual types it has been operating
+          on and rewrites the opcode in place to a specialised form: a
+          <code>BINARY_OP</code> that has been seeing two integers
+          becomes <code>BINARY_OP_ADD_INT</code>, which skips the
+          type-dispatch and the boxing-unboxing for the common case.
+          If the assumptions of the specialised form are violated,
+          for example because the operands are now strings rather than
+          integers, the opcode deoptimises to its generic form and may
+          re-specialise later if the types stabilise again.
+        </p>
+
+        <div id="fig-specialise"></div>
+
+        <p>
+          The figure above runs a small loop and shows the counter
+          incrementing on each iteration; when the counter reaches the
+          threshold the opcode is recorded as specialised, and
+          subsequent iterations execute the specialised form. The
+          per-iteration cost is shown shorter for the specialised
+          iterations, with a non-colour glyph marking those bars so the
+          distinction survives in a monochrome rendering. The threshold
+          and the precise mechanism by which the interpreter chooses a
+          specialisation are tuning parameters of the runtime; the
+          implementation in CPython 3.13 is more sophisticated than the
+          stylised version the figure presents, but the principle is
+          the same.
+        </p>
+        <p>
+          The specialising interpreter is the largest change to the
+          CPython evaluation loop since the introduction of the wordcode
+          format. Its consequence is a multi-release stream of speedups
+          across the language, with the largest gains in tight loops on
+          integer and floating-point data, the smallest in code
+          dominated by I/O or by extension calls. The accompanying PEP
+          657 <a class="cite" href="#ref-7">[7]</a>, which added
+          fine-grained error locations, was made necessary by the new
+          interpreter's reorganisation of the bytecode: tracebacks could
+          now report which sub-expression of a line failed rather than
+          merely the line number, a substantial improvement in
+          diagnostic value.
+        </p>
+        <p>
+          A reasonable question to ask of the specialising interpreter
+          is how it compares with a just-in-time compiler. A JIT
+          compiles hot code paths to machine code that bypasses the
+          eval loop altogether; the specialising interpreter only
+          replaces opcodes in the existing eval loop with cheaper
+          opcodes, leaving the dispatcher in place. The simpler approach
+          has two engineering advantages that have kept CPython on the
+          interpreter side of the design space. It preserves the C API
+          unchanged, which the JIT-based alternatives discussed in the
+          third section have all struggled with. And it does not require
+          a code-generation backend in CPython itself, which keeps the
+          build dependencies and the security surface small. The
+          intermediate step, a copy-and-patch tier that emits small
+          templates of machine code per opcode, is being explored as
+          the next stage in the Faster CPython roadmap.
+        </p>
+      </section>
+
+      <section id="s8">
+        <h2><span class="secnum">8</span>Frames and the call stack</h2>
+        <p>
+          A frame is the runtime object corresponding to one invocation
+          of a Python function. It owns the function's local variables,
+          its value stack, a pointer back to its caller, and a record of
+          where execution is suspended. CPython holds the active frames
+          on a per-thread call stack: each call pushes a new frame, each
+          return pops the top frame and restores the caller. The frame
+          object is exposed to Python through <code>sys._getframe</code>
+          and is the underlying representation that <code>inspect</code>
+          uses to walk the stack and that the <code>traceback</code>
+          module formats for printing.
+        </p>
+        <p>
+          The figure below steps through a short trace of calls and
+          returns. The call stack grows as each call pushes its frame
+          and shrinks as each return pops the top. The active frame, the
+          top of the stack, is the one whose bytecode is currently
+          executing; the frames beneath it are paused at the
+          <code>CALL</code> instruction that invoked the function above
+          them and will resume after that <code>CALL</code> returns.
+        </p>
+
+        <div id="fig-callstack"></div>
+
+        <p>
+          Two structural changes have affected CPython's frame design in
+          the recent past. The first is the lazy frame creation
+          introduced in CPython 3.11: a function call no longer
+          unconditionally allocates a heap-resident frame object;
+          instead, the per-frame data sits inline in the eval loop's
+          local memory, and a heap frame is materialised only when the
+          program does something that requires it, such as walk the
+          stack with <code>sys._getframe</code> or raise an exception
+          whose traceback wants to reference the frame. The lazy
+          allocation saved both an allocation and the corresponding
+          freeing for the common case of a function that returns
+          normally, and was one of the larger speedups of the 3.11
+          release.
+        </p>
+        <p>
+          The second is the introduction of a per-interpreter execution
+          state in PEP 684, alongside subinterpreters, which let a
+          single process host several independent Python interpreters,
+          each with its own modules, threads and call stack. The
+          motivation was a path forward for parallelism on the GIL-
+          enabled build: while a single interpreter is bottlenecked on
+          the GIL, multiple subinterpreters in one process each carry
+          their own GIL and can run in parallel. The subinterpreters
+          feature was made usable from pure Python in CPython 3.13 by
+          PEP 734, and it sits alongside the free-threaded build as a
+          second route to parallel pure-Python code.
+        </p>
+      </section>
+
+      <section id="s9">
+        <h2><span class="secnum">9</span>Free-threaded CPython and the GIL</h2>
+        <p>
+          The global interpreter lock has been a fact of CPython since
+          its earliest releases. It is a single mutex that serialises
+          access to interpreter state: a thread that wants to execute
+          Python bytecode must hold it, and the interpreter releases it
+          periodically to allow other threads to run. The GIL exists
+          because the reference-counting memory manager is not
+          thread-safe by construction: a non-atomic increment of a
+          reference count on one thread can race with a decrement on
+          another, with the result that an object is either freed
+          prematurely or leaked. The simplest correctness fix is a
+          coarse-grained lock on the entire interpreter, and that is
+          what the GIL has always been.
+        </p>
+        <p>
+          The performance consequence is that CPython programs cannot
+          execute Python bytecode on more than one core simultaneously.
+          Programs that are dominated by extension calls or by I/O
+          benefit from threads, because both release the GIL while they
+          wait; programs that are dominated by pure-Python computation
+          do not. The standard workaround has been to run multiple
+          processes via the <code>multiprocessing</code> module, paying
+          the cost of process creation and inter-process communication
+          to get the parallelism back. PEP 684's subinterpreters offered
+          an in-process alternative that avoids the IPC cost, at the
+          price of requiring the program to be structured around the
+          subinterpreter boundary.
+        </p>
+        <p>
+          PEP 703 <a class="cite" href="#ref-8">[8]</a>, accepted in
+          2023, removes the GIL as a fundamental architectural
+          commitment. It rewrites the reference-counting memory manager
+          to use atomic operations, partitions the cyclic garbage
+          collector's data structures so that they can be updated by
+          multiple threads without contention, and replaces the
+          historical assumption of single-threaded interpreter state
+          with explicit per-thread state where appropriate. The
+          free-threaded build of CPython 3.13 is available as a
+          compile-time option, and the design is for the GIL-free build
+          to become the default once its single-threaded performance
+          parity is established. The trade-off in the current free-
+          threaded build is a small single-threaded penalty, on the
+          order of ten to fifteen per cent, in exchange for genuine
+          parallel execution of Python bytecode across cores. The
+          long-running engineering work on closing that single-threaded
+          gap will be the major story of CPython's performance
+          development over the next several releases.
+        </p>
+        <p>
+          A practical word on the threading APIs that sit above the GIL
+          is in order. The <code>threading</code> module gives a
+          high-level threading interface; the <code>concurrent.futures</code>
+          module gives a thread-pool abstraction whose
+          <code>ThreadPoolExecutor</code> is the recommended way to
+          parallelise blocking I/O. The <code>asyncio</code> module runs
+          a cooperative event loop on a single thread and uses
+          coroutines to interleave I/O-bound tasks without the overhead
+          of threads; it is the right tool for high-fanout I/O
+          workloads, and the wrong tool for CPU-bound work, which it
+          serialises on its event-loop thread. With free-threaded
+          CPython the calculus shifts: CPU-bound pure-Python work can
+          now scale across cores without the multiprocessing escape
+          hatch, and the standard threading and futures APIs apply
+          unchanged. The asyncio model remains the right one for
+          I/O-bound work regardless of whether the GIL is present.
+        </p>
+      </section>
+
+      <section id="s10">
+        <h2><span class="secnum">10</span>Conclusion</h2>
+        <p>
+          The CPython interpreter is built from a small set of named
+          parts, and the document has visited each of them. The compiler
+          lowers Python source into a sequence of bytecodes. The eval
+          loop dispatches each bytecode in turn, manipulating a
+          per-frame value stack. The frame object encapsulates one
+          invocation of a function, and frames sit on a per-thread call
+          stack. Memory is managed primarily by reference counting,
+          with a generational cyclic garbage collector reclaiming the
+          cycles that the refcount alone cannot. The specialising
+          adaptive interpreter rewrites hot opcodes into faster type-
+          specialised forms. The threading model has been governed by
+          the global interpreter lock for most of CPython's history and
+          is now being incrementally freed of it. The combination has
+          made CPython the canonical Python implementation for thirty
+          years, and is the basis on which the language's continued
+          performance evolution is built.
+        </p>
+        <p>
+          The literature review placed the parts in time and argued
+          that the present interpreter is the layered result of three
+          eras of work: the foundational era in which the architecture
+          was settled; the long middle era in which alternative
+          implementations demonstrated that Python could be faster
+          without proving it could be faster within CPython; and the
+          current era of sustained engineering inside CPython that has
+          delivered substantial speedups in each release since 3.11 and
+          has begun the removal of the GIL. The two threads of that
+          history, the professionalisation of CPython's performance
+          work and the gradual loosening of architectural commitments
+          taken in the 1990s, are visible in every recent release note.
+        </p>
+        <p>
+          A reader who has followed the development is positioned to
+          read the CPython source itself, which is available on GitHub
+          at <code>python/cpython</code> and is, by the standards of
+          language interpreters, unusually readable. The eval loop is
+          in <code>Python/ceval.c</code>; the compiler is in
+          <code>Python/compile.c</code>; the cyclic garbage collector
+          is in <code>Modules/gcmodule.c</code>; the specialising
+          interpreter machinery is in <code>Python/specialize.c</code>;
+          the threading code is in <code>Python/pystate.c</code>. The
+          PEPs cited in the references are the long-form design
+          documents that describe each change in detail. The
+          combination of source code and PEPs is the reference material
+          this monograph is a guide to.
+        </p>
+        <a class="totop" href="#main">Return to contents</a>
+      </section>
+
+      <section id="refs" class="references" aria-label="References">
+        <h2><span class="secnum">R</span>References</h2>
+        <ol>
+          <li id="ref-1">Aycock, J. (2003). A brief history of just-in-time. <i>ACM Computing Surveys</i>, 35(2), 97–113.</li>
+          <li id="ref-2">Bolz, C. F., Cuni, A., Fijalkowski, M. and Rigo, A. (2009). Tracing the meta-level: PyPy's tracing JIT compiler. <i>Proceedings of ICOOOLPS</i>.</li>
+          <li id="ref-3">Modzelewski, K., Coughlin, T. and Iyer, V. (2014). Pyston: an open-source Python JIT. <i>Dropbox Tech Blog</i>.</li>
+          <li id="ref-4">Würthinger, T., Wimmer, C., Wöß, A., Stadler, L., Duboscq, G., Humer, C., Richards, G., Simon, D. and Wolczko, M. (2013). One VM to rule them all. <i>Proceedings of Onward!</i>.</li>
+          <li id="ref-5">Shannon, M. (2011). Type inference and deoptimization for dynamically typed languages. PhD thesis, Imperial College London.</li>
+          <li id="ref-6">Shannon, M. (2021). PEP 659: Specializing adaptive interpreter. Python Software Foundation.</li>
+          <li id="ref-7">Galindo Salgado, P. (2021). PEP 657: Include fine grained error locations in tracebacks. Python Software Foundation.</li>
+          <li id="ref-8">Gross, S. (2023). PEP 703: Making the global interpreter lock optional in CPython. Python Software Foundation.</li>
+          <li id="ref-9">Beazley, D. (2010). Understanding the Python GIL. PyCon 2010.</li>
+          <li id="ref-10">van Rossum, G. (1995). Python tutorial. CWI Technical Report CS-R9526.</li>
+          <li id="ref-11">CPython source code. <i>github.com/python/cpython</i>.</li>
+        </ol>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-foot">
+    <div class="wrap">
+      Bytecode — an interactive monograph on the CPython interpreter. Built
+      with vanilla HTML, CSS and JavaScript; no frameworks, no build step.
+      Keyboard-operable and built to WCAG 2.2 AA. The text-heavy listing
+      and value-stack figures are real DOM, with `aria-current` on the
+      active line; the object-graph and adaptive-interpreter figures use
+      canvas with off-canvas radiogroup selection.
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    Bytecode.initProgress("progress-bar");
+    Bytecode.listing({ mount: "#fig-listing",
+      caption: "<b>Figure 1.</b> A small Python function alongside its disassembly. " +
+        "The program counter advances with the arrow keys; the active source line and " +
+        "active bytecode are marked with a chevron and aria-current." });
+    Bytecode.valueStack({ mount: "#fig-stack",
+      caption: "<b>Figure 2.</b> The value stack as the bytecode of the previous figure " +
+        "executes. The cells are a real DOM table with row and column headers." });
+    Bytecode.refcount({ mount: "#fig-refcount",
+      caption: "<b>Figure 3.</b> A short script of name bindings, with each object's " +
+        "reference count updating as bindings are added and removed." });
+    Bytecode.gc({ mount: "#fig-gc",
+      caption: "<b>Figure 4.</b> A small object graph with a cycle of two mutually " +
+        "referencing objects. Running mark-and-sweep collects the unreachable cycle." });
+    Bytecode.specialise({ mount: "#fig-specialise",
+      caption: "<b>Figure 5.</b> The specialising adaptive interpreter. The execution " +
+        "counter climbs each iteration; at the threshold the opcode is replaced by its " +
+        "type-specialised form." });
+    Bytecode.callStack({ mount: "#fig-callstack",
+      caption: "<b>Figure 6.</b> The call stack as a trace of function calls and " +
+        "returns is stepped through. Each call pushes a frame; each return pops one." });
+  </script>
+</body>
+</html>
